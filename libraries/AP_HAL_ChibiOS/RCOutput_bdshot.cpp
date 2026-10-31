@@ -242,6 +242,20 @@ void RCOutput::bdshot_ic_dma_deallocate(Shared_DMA *ctx)
     }
 }
 
+// the error rate of a channel's replies, percent. A window that has just restarted is too short
+// to stand alone, so it reports no less than the last full window, or 100% before there is one,
+// while still showing errors it has already counted
+float RCOutput::bdshot_error_rate(uint8_t chan) const
+{
+    const uint32_t frames = _bdshot.erpm_errors[chan] + _bdshot.erpm_clean_frames[chan];
+    const float rate = frames == 0 ? 0.0f : 100.0f * float(_bdshot.erpm_errors[chan]) / frames;
+    if (frames >= BDSHOT_ERROR_RATE_MIN_FRAMES) {
+        return rate;
+    }
+    const float last = (_bdshot.erpm_window_mask & (1U << chan)) ? _bdshot.erpm_window_error_rate[chan] : 100.0f;
+    return rate > last ? rate : last;
+}
+
 // setup bdshot for sending and receiving the next pulse
 void RCOutput::bdshot_prepare_for_next_pulse(pwm_group& group)
 {
@@ -273,6 +287,20 @@ void RCOutput::bdshot_prepare_for_next_pulse(pwm_group& group)
         // the DMA callback has already moved curr_telem_chan on to the next slot
         uint8_t chan = group.chan[group.bdshot.prev_telem_chan];
         uint32_t now = AP_HAL::millis();
+        // reset statistics periodically, before counting this reply so that a failure it shows
+        // lands in the new window. The finished window's rate is kept as the floor while the new
+        // one is too short to stand alone; a window with too few frames, such as one cut short
+        // by a pause in telemetry, gives no rate
+        if (now - _bdshot.erpm_last_stats_ms[chan] > 5000) {
+            const uint32_t frames = _bdshot.erpm_errors[chan] + _bdshot.erpm_clean_frames[chan];
+            if (frames >= BDSHOT_ERROR_RATE_MIN_FRAMES) {
+                _bdshot.erpm_window_error_rate[chan] = 100.0f * float(_bdshot.erpm_errors[chan]) / frames;
+                _bdshot.erpm_window_mask |= 1U << chan;
+            }
+            _bdshot.erpm_clean_frames[chan] = 0;
+            _bdshot.erpm_errors[chan] = 0;
+            _bdshot.erpm_last_stats_ms[chan] = now;
+        }
         if (group.dshot_state == DshotState::RECV_COMPLETE
             && bdshot_decode_dshot_telemetry(group, group.bdshot.prev_telem_chan)) {
             _bdshot.erpm_clean_frames[chan]++;
@@ -280,12 +308,8 @@ void RCOutput::bdshot_prepare_for_next_pulse(pwm_group& group)
         } else {
             _bdshot.erpm_errors[chan]++;
         }
-        // reset statistics periodically
-        if (now - _bdshot.erpm_last_stats_ms[chan] > 5000) {
-            _bdshot.erpm_clean_frames[chan] = 0;
-            _bdshot.erpm_errors[chan] = 0;
-            _bdshot.erpm_last_stats_ms[chan] = now;
-        }
+        // publish a single value, which a reader on another thread cannot see torn by a restart
+        _bdshot.erpm_error_rate[chan] = bdshot_error_rate(chan);
     }
 
     if (group.bdshot.enabled) {
